@@ -30,7 +30,7 @@ func Load() *Config {
 		MaxConcurrency:    getEnvInt("MAX_CONCURRENCY", 3),
 		RateLimitDelay:    getEnvInt("RATE_LIMIT_DELAY_MS", 2000),
 		MaxRetries:        getEnvInt("MAX_RETRIES", 3),
-		PropertiesPerPage: getEnvInt("PROPERTIES_PER_SECTION", 5),
+		PropertiesPerPage: getEnvInt("PROPERTIES_PER_SECTION", 10),
 		CSVFilePath:       getEnv("CSV_FILE_PATH", "output/raw_listings.csv"),
 		AirbnbURL:         getEnv("AIRBNB_URL", "https://www.airbnb.com"),
 	}
