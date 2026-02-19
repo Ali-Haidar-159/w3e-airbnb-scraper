@@ -13,15 +13,13 @@ A production-grade, concurrent web scraping system built in **Go** using the `ch
 - [Installation](#installation)
   - [1. Clone the Repository](#1-clone-the-repository)
   - [2. Install Go](#2-install-go)
-  - [3. Install Chromium](#3-install-chromium)
-  - [4. Set Up PostgreSQL via Docker](#4-set-up-postgresql-via-docker)
-  - [5. Install Go Dependencies](#5-install-go-dependencies)
+  - [3. Set Up PostgreSQL via Docker](#4-set-up-postgresql-via-docker)
+  - [4. Install Go Dependencies](#5-install-go-dependencies)
 - [Configuration](#configuration)
 - [Running the Project](#running-the-project)
 - [Expected Output](#expected-output)
 - [Database Schema](#database-schema)
 - [Verifying the Data](#verifying-the-data)
-- [Troubleshooting](#troubleshooting)
 
 ---
 
