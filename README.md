@@ -172,6 +172,12 @@ All settings have working defaults. Override any of them by exporting environmen
 
 ## Running the Project
 
+### Shortcut run using run.sh :
+```bash
+chmod +x run.sh
+./run.sh
+```
+
 ### Standard run (recommended defaults):
 ```bash
 go run main.go
