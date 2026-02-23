@@ -39,53 +39,53 @@ func NewAirbnbScraper(cfg *config.Config, logger *utils.Logger) *AirbnbScraper {
 	}
 }
 
-// newContext creates a fresh chromedp context (one browser, one tab at a time)
-func (s *AirbnbScraper) newContext() (context.Context, context.CancelFunc) {
+// newBrowserContext creates a fresh headless browser context
+func (s *AirbnbScraper) newBrowserContext() (context.Context, context.CancelFunc) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("log-level", "3"), // suppress Chrome logs
+		chromedp.Flag("log-level", "3"),
 		chromedp.UserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-		chromedp.WindowSize(1280, 900),
+		chromedp.WindowSize(1440, 900),
 	)
 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
-	ctx, cancelCtx := chromedp.NewContext(allocCtx, chromedp.WithLogf(func(string, ...interface{}) {}))
-
-	cancel := func() {
+	ctx, cancelCtx := chromedp.NewContext(
+		allocCtx,
+		chromedp.WithLogf(func(string, ...interface{}) {}), // suppress noise
+	)
+	return ctx, func() {
 		cancelCtx()
 		cancelAlloc()
 	}
-	return ctx, cancel
 }
 
 // Scrape is the main entry point
 func (s *AirbnbScraper) Scrape() ([]*models.RawListing, error) {
 	s.logger.Info("Starting Airbnb scraper...")
 
-	ctx, cancel := s.newContext()
+	ctx, cancel := s.newBrowserContext()
 	defer cancel()
 
-	ctx, cancelTimeout := context.WithTimeout(ctx, 25*time.Minute)
+	ctx, cancelTimeout := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancelTimeout()
 
-	// Step 1: Discover location sections from homepage
+	// Step 1: discover sections from homepage
 	sections, err := s.discoverSections(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("section discovery failed: %w", err)
-	}
-	if len(sections) == 0 {
-		return nil, fmt.Errorf("no sections found on Airbnb homepage")
-	}
-	s.logger.Info("Found %d location sections", len(sections))
-	for i, sec := range sections {
-		s.logger.Info("  [%d] %s -> %s", i+1, sec.Name, sec.URL)
+	if err != nil || len(sections) == 0 {
+		s.logger.Warn("Homepage JS discovery failed or returned 0 sections, using fallback search URLs...")
+		sections = s.fallbackSections()
 	}
 
-	// Step 2: Scrape each section sequentially (avoid overwhelming Airbnb)
+	s.logger.Info("Scraping %d location sections...", len(sections))
+	for i, sec := range sections {
+		s.logger.Info("  [%d] %s", i+1, sec.Name)
+	}
+
+	// Step 2: scrape each section
 	var allListings []*models.RawListing
 	for _, section := range sections {
 		s.rateLimiter.Wait()
@@ -95,7 +95,7 @@ func (s *AirbnbScraper) Scrape() ([]*models.RawListing, error) {
 			continue
 		}
 		allListings = append(allListings, listings...)
-		s.logger.Info("Section '%s': collected %d listings (total so far: %d)",
+		s.logger.Info("Section '%s' done: %d listings (total: %d)",
 			section.Name, len(listings), len(allListings))
 	}
 
@@ -103,96 +103,119 @@ func (s *AirbnbScraper) Scrape() ([]*models.RawListing, error) {
 	return allListings, nil
 }
 
-// discoverSections loads the homepage and finds all "X in City" section links
+// discoverSections tries to extract section links from the Airbnb homepage via JS
 func (s *AirbnbScraper) discoverSections(ctx context.Context) ([]LocationSection, error) {
 	s.logger.Info("Loading Airbnb homepage...")
 
-	// Navigate with a simple load wait, not waiting for specific element
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(s.cfg.AirbnbURL),
-		chromedp.Sleep(5*time.Second), // give JS time to render
+		chromedp.Sleep(6*time.Second),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("homepage navigation failed: %w", err)
+		return nil, fmt.Errorf("homepage load failed: %w", err)
 	}
 
 	s.logger.Info("Homepage loaded, extracting sections...")
 
-	// Extract all section heading + link pairs via JS
-	type sectionData struct {
+	type sd struct {
 		Name string `json:"name"`
 		URL  string `json:"url"`
 	}
-	var rawSections []sectionData
+	var raw []sd
 
+	// Try multiple JS strategies to find section headings + their links
 	err = chromedp.Run(ctx, chromedp.Evaluate(`
 		(function() {
 			var results = [];
 			var seen = {};
 
-			// Strategy 1: find <section> elements with an <a href="/s/...">
+			// Strategy 1: <section> with h2 + a[href*="/s/"]
 			document.querySelectorAll('section').forEach(function(sec) {
-				var heading = sec.querySelector('h2');
-				var link = sec.querySelector('a[href*="/s/"]');
-				if (!heading || !link) return;
-				var name = heading.innerText.trim();
-				var href = link.href;
-				if (name && href && !seen[href]) {
-					seen[href] = true;
-					results.push({name: name, url: href});
+				var h = sec.querySelector('h2');
+				var a = sec.querySelector('a[href*="/s/"]');
+				if (h && a && !seen[a.href]) {
+					seen[a.href] = true;
+					results.push({name: h.innerText.trim(), url: a.href});
 				}
 			});
 
-			// Strategy 2: find heading > sibling/child links (Airbnb sometimes uses div-based sections)
+			// Strategy 2: any h2 near an anchor with /s/
 			if (results.length === 0) {
 				document.querySelectorAll('h2').forEach(function(h2) {
 					var name = h2.innerText.trim();
 					if (!name) return;
-					// Look for a nearby anchor
-					var parent = h2.closest('div[class]') || h2.parentElement;
-					if (!parent) return;
-					var link = parent.querySelector('a[href*="/s/"]');
-					if (!link) {
-						// try going up one more level
-						parent = parent.parentElement;
-						if (parent) link = parent.querySelector('a[href*="/s/"]');
+					var p = h2.parentElement;
+					for (var i = 0; i < 4; i++) {
+						if (!p) break;
+						var a = p.querySelector('a[href*="/s/"]');
+						if (a && !seen[a.href]) {
+							seen[a.href] = true;
+							results.push({name: name, url: a.href});
+							break;
+						}
+						p = p.parentElement;
 					}
-					if (link && !seen[link.href]) {
-						seen[link.href] = true;
-						results.push({name: name, url: link.href});
+				});
+			}
+
+			// Strategy 3: all unique /s/ links with text
+			if (results.length === 0) {
+				document.querySelectorAll('a[href*="/s/"]').forEach(function(a) {
+					var text = a.innerText.trim() || a.getAttribute('aria-label') || '';
+					if (text && !seen[a.href]) {
+						seen[a.href] = true;
+						results.push({name: text, url: a.href});
 					}
 				});
 			}
 
 			return results;
 		})()
-	`, &rawSections))
+	`, &raw))
 
 	if err != nil {
-		return nil, fmt.Errorf("JS section extraction failed: %w", err)
+		return nil, err
 	}
 
 	var sections []LocationSection
-	for _, rs := range rawSections {
-		if rs.Name == "" || rs.URL == "" {
+	for _, r := range raw {
+		if r.Name == "" || r.URL == "" {
 			continue
 		}
-		sections = append(sections, LocationSection{Name: rs.Name, URL: rs.URL})
+		sections = append(sections, LocationSection{Name: r.Name, URL: r.URL})
 	}
-
 	return sections, nil
 }
 
-// scrapeSection scrapes PropertiesPerPage listings from a section, paginating as needed
-func (s *AirbnbScraper) scrapeSection(ctx context.Context, section LocationSection) ([]*models.RawListing, error) {
-	s.logger.Info("Scraping section: %s", section.Name)
+// fallbackSections returns hardcoded popular Airbnb search URLs
+// used when homepage JS discovery fails due to Airbnb HTML changes
+func (s *AirbnbScraper) fallbackSections() []LocationSection {
+	base := "https://www.airbnb.com/s"
+	return []LocationSection{
+		{Name: "Bangkok", URL: base + "/Bangkok--Thailand/homes"},
+		{Name: "Kuala Lumpur", URL: base + "/Kuala-Lumpur--Malaysia/homes"},
+		{Name: "Tokyo", URL: base + "/Tokyo--Japan/homes"},
+		{Name: "Bali", URL: base + "/Bali--Indonesia/homes"},
+		{Name: "Seoul", URL: base + "/Seoul--South-Korea/homes"},
+		{Name: "Singapore", URL: base + "/Singapore/homes"},
+		{Name: "Paris", URL: base + "/Paris--France/homes"},
+		{Name: "New York", URL: base + "/New-York--NY--United-States/homes"},
+		{Name: "London", URL: base + "/London--United-Kingdom/homes"},
+		{Name: "Dubai", URL: base + "/Dubai--United-Arab-Emirates/homes"},
+	}
+}
 
-	var allListings []*models.RawListing
+// scrapeSection collects PropertiesPerPage listings from a section, paginating as needed
+func (s *AirbnbScraper) scrapeSection(ctx context.Context, section LocationSection) ([]*models.RawListing, error) {
+	s.logger.Info("Scraping: %s", section.Name)
+
+	var collected []*models.RawListing
 	currentURL := section.URL
 	page := 1
 
-	for len(allListings) < s.cfg.PropertiesPerPage {
-		s.logger.Info("  [%s] page %d (have %d/%d)...", section.Name, page, len(allListings), s.cfg.PropertiesPerPage)
+	for len(collected) < s.cfg.PropertiesPerPage {
+		s.logger.Info("  [%s] page %d (have %d/%d)...",
+			section.Name, page, len(collected), s.cfg.PropertiesPerPage)
 
 		listings, nextURL, err := s.scrapePage(ctx, currentURL, section.Name)
 		if err != nil {
@@ -200,15 +223,14 @@ func (s *AirbnbScraper) scrapeSection(ctx context.Context, section LocationSecti
 			break
 		}
 		if len(listings) == 0 {
-			s.logger.Warn("  No listings found on page %d", page)
+			s.logger.Warn("  No listings on page %d", page)
 			break
 		}
 
 		for _, l := range listings {
-			if len(allListings) >= s.cfg.PropertiesPerPage {
+			if len(collected) >= s.cfg.PropertiesPerPage {
 				break
 			}
-			// Dedup by URL
 			s.mu.Lock()
 			if s.seenURLs[l.URL] {
 				s.mu.Unlock()
@@ -217,15 +239,15 @@ func (s *AirbnbScraper) scrapeSection(ctx context.Context, section LocationSecti
 			s.seenURLs[l.URL] = true
 			s.mu.Unlock()
 
-			// Enrich if needed
+			// Optionally enrich from detail page
 			if l.Description == "" && l.URL != "" {
 				s.rateLimiter.Wait()
 				s.enrichDetail(ctx, l)
 			}
-			allListings = append(allListings, l)
+			collected = append(collected, l)
 		}
 
-		if nextURL == "" || len(allListings) >= s.cfg.PropertiesPerPage {
+		if len(collected) >= s.cfg.PropertiesPerPage || nextURL == "" {
 			break
 		}
 		currentURL = nextURL
@@ -233,124 +255,119 @@ func (s *AirbnbScraper) scrapeSection(ctx context.Context, section LocationSecti
 		s.rateLimiter.Wait()
 	}
 
-	return allListings, nil
+	return collected, nil
 }
 
-// scrapePage navigates to a search results page and extracts listing cards
-func (s *AirbnbScraper) scrapePage(ctx context.Context, pageURL string, sectionName string) ([]*models.RawListing, string, error) {
+// scrapePage navigates to a search result page and extracts all listing cards
+func (s *AirbnbScraper) scrapePage(ctx context.Context, pageURL, sectionName string) ([]*models.RawListing, string, error) {
 	var listings []*models.RawListing
 	var nextURL string
 
 	err := utils.RetryWithBackoff(s.cfg.MaxRetries, func() error {
-		// Navigate
-		err := chromedp.Run(ctx,
+		if err := chromedp.Run(ctx,
 			chromedp.Navigate(pageURL),
-			chromedp.Sleep(4*time.Second), // wait for JS render
-		)
-		if err != nil {
+			chromedp.Sleep(5*time.Second),
+		); err != nil {
 			return fmt.Errorf("navigate failed: %w", err)
 		}
 
-		// Try to wait for any listing card (try multiple selectors)
-		waitErr := chromedp.Run(ctx, chromedp.WaitVisible(`[itemprop="itemListElement"]`, chromedp.ByQuery))
-		if waitErr != nil {
-			// fallback: just wait a bit more
-			_ = chromedp.Run(ctx, chromedp.Sleep(3*time.Second))
-		}
+		// Try to wait for cards — but don't block if they don't appear
+		_ = chromedp.Run(ctx, chromedp.WaitVisible(`[data-testid="card-container"]`, chromedp.ByQuery))
 
-		// Extract cards
-		type cardData struct {
+		type card struct {
 			Title    string `json:"title"`
 			Price    string `json:"price"`
 			Rating   string `json:"rating"`
 			URL      string `json:"url"`
 			Location string `json:"location"`
 		}
-		var cards []cardData
+		var cards []card
 
-		jsErr := chromedp.Run(ctx, chromedp.Evaluate(`
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
-				var cards = [];
+				var results = [];
 
-				// Approach A: data-testid="card-container"
-				var containers = document.querySelectorAll('[data-testid="card-container"]');
+				// Find all listing containers using multiple selector strategies
+				var containers = [];
 
-				// Approach B: itemprop listing items
+				// Strategy A: official test id
+				var a = document.querySelectorAll('[data-testid="card-container"]');
+				if (a.length > 0) { containers = Array.from(a); }
+
+				// Strategy B: itemprop
 				if (containers.length === 0) {
-					containers = document.querySelectorAll('[itemprop="itemListElement"]');
+					containers = Array.from(document.querySelectorAll('[itemprop="itemListElement"]'));
 				}
 
-				// Approach C: any div with a room link child
+				// Strategy C: parent div of any /rooms/ link
 				if (containers.length === 0) {
-					var links = document.querySelectorAll('a[href*="/rooms/"]');
-					var parents = new Set();
-					links.forEach(function(a) {
-						var p = a.closest('div[class]');
-						if (p) parents.add(p);
+					var seen = new Set();
+					document.querySelectorAll('a[href*="/rooms/"]').forEach(function(a) {
+						var p = a.parentElement;
+						for (var i = 0; i < 5; i++) {
+							if (!p) break;
+							if (p.querySelectorAll('a[href*="/rooms/"]').length === 1) {
+								if (!seen.has(p)) { seen.add(p); containers.push(p); }
+								break;
+							}
+							p = p.parentElement;
+						}
 					});
-					containers = Array.from(parents);
 				}
 
 				containers.forEach(function(card) {
-					// Title
-					var titleEl = card.querySelector('[data-testid="listing-card-title"]') ||
-					              card.querySelector('[id^="title_"]') ||
-					              card.querySelector('[itemprop="name"]') ||
-					              card.querySelector('div[class*="t1ms2xzu"]');
+					// ── Title ──────────────────────────────────────────────
+					var titleEl =
+						card.querySelector('[data-testid="listing-card-title"]') ||
+						card.querySelector('[id^="title_"]') ||
+						card.querySelector('[itemprop="name"]');
 					var title = titleEl ? titleEl.innerText.trim() : '';
 
-					// Price: look for $ in any span
+					// ── Price ──────────────────────────────────────────────
 					var price = '';
-					var spans = card.querySelectorAll('span');
-					for (var i = 0; i < spans.length; i++) {
-						var t = spans[i].innerText.trim();
-						if (t.startsWith('$') && t.length < 40) {
-							price = t;
-							break;
-						}
-					}
-					// Also check aria-label on price containers
+					// look for aria-label containing "per night"
+					var priceAria = card.querySelector('[aria-label*="per night"]');
+					if (priceAria) { price = priceAria.getAttribute('aria-label'); }
+					// fallback: first span starting with $
 					if (!price) {
-						var priceEl = card.querySelector('[aria-label*="per night"]') ||
-						              card.querySelector('[class*="price"]');
-						if (priceEl) price = priceEl.innerText.trim();
+						card.querySelectorAll('span').forEach(function(sp) {
+							if (!price && sp.innerText.trim().startsWith('$')) {
+								price = sp.innerText.trim();
+							}
+						});
 					}
 
-					// Rating: look for pattern like "4.xx"
+					// ── Rating ─────────────────────────────────────────────
 					var rating = '';
-					for (var j = 0; j < spans.length; j++) {
-						var rt = spans[j].innerText.trim();
-						if (/^[345]\.\d{1,2}$/.test(rt)) {
-							rating = rt;
-							break;
-						}
-					}
-					// Also check aria-label="X out of 5"
+					var ratingAria = card.querySelector('[aria-label*="out of 5"]');
+					if (ratingAria) { rating = ratingAria.getAttribute('aria-label'); }
 					if (!rating) {
-						var ratingEl = card.querySelector('[aria-label*="out of 5"]');
-						if (ratingEl) rating = ratingEl.getAttribute('aria-label') || '';
+						card.querySelectorAll('span').forEach(function(sp) {
+							if (!rating && /^[345]\.\d{1,2}$/.test(sp.innerText.trim())) {
+								rating = sp.innerText.trim();
+							}
+						});
 					}
 
-					// URL
+					// ── URL ────────────────────────────────────────────────
 					var linkEl = card.querySelector('a[href*="/rooms/"]');
 					var url = linkEl ? linkEl.href : '';
 
-					// Location from title
+					// ── Location ───────────────────────────────────────────
 					var location = '';
 					if (title.includes(' in ')) {
 						location = title.split(' in ').slice(1).join(' in ');
 					}
 
 					if (title || url) {
-						cards.push({title:title, price:price, rating:rating, url:url, location:location});
+						results.push({title:title, price:price, rating:rating, url:url, location:location});
 					}
 				});
 
-				return cards;
+				return results;
 			})()
-		`, &cards))
-		if jsErr != nil {
-			return fmt.Errorf("card JS failed: %w", jsErr)
+		`, &cards)); err != nil {
+			return fmt.Errorf("JS extraction failed: %w", err)
 		}
 
 		listings = nil
@@ -370,15 +387,14 @@ func (s *AirbnbScraper) scrapePage(ctx context.Context, pageURL string, sectionN
 			})
 		}
 
-		// Find next page link
+		// Next page link
 		var next string
 		_ = chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
-				var btn = document.querySelector('a[aria-label="Next"]') ||
-				          document.querySelector('[data-testid="pagination-next-btn"]') ||
-				          document.querySelector('a[href*="items_offset"]') ||
-				          document.querySelector('a[href*="pagination"]');
-				return btn ? btn.href : '';
+				var n = document.querySelector('a[aria-label="Next"]') ||
+				        document.querySelector('[data-testid="pagination-next-btn"]') ||
+				        document.querySelector('a[href*="items_offset"]');
+				return n ? n.href : '';
 			})()
 		`, &next))
 		nextURL = next
@@ -388,7 +404,7 @@ func (s *AirbnbScraper) scrapePage(ctx context.Context, pageURL string, sectionN
 	return listings, nextURL, err
 }
 
-// enrichDetail visits a listing's detail page to grab the description
+// enrichDetail fetches the listing detail page to grab description
 func (s *AirbnbScraper) enrichDetail(ctx context.Context, listing *models.RawListing) {
 	if listing.URL == "" {
 		return
@@ -401,10 +417,10 @@ func (s *AirbnbScraper) enrichDetail(ctx context.Context, listing *models.RawLis
 		chromedp.Sleep(3*time.Second),
 		chromedp.Evaluate(`
 			(function() {
-				var el = document.querySelector('[data-section-id="DESCRIPTION_DEFAULT"] span') ||
-				         document.querySelector('[data-section-id="OVERVIEW_DEFAULT"] h1') ||
-				         document.querySelector('h1[class*="hpipapi"]') ||
-				         document.querySelector('h1');
+				var el =
+					document.querySelector('[data-section-id="DESCRIPTION_DEFAULT"] span') ||
+					document.querySelector('[data-section-id="OVERVIEW_DEFAULT"] h1') ||
+					document.querySelector('h1');
 				return el ? el.innerText.trim() : '';
 			})()
 		`, &desc),
@@ -413,7 +429,6 @@ func (s *AirbnbScraper) enrichDetail(ctx context.Context, listing *models.RawLis
 		s.logger.Warn("  Enrich failed for '%s': %v", listing.Title, err)
 		return
 	}
-	// If desc is just repeating the title, skip
 	if desc != "" && !strings.EqualFold(strings.TrimSpace(desc), strings.TrimSpace(listing.Title)) {
 		listing.Description = desc
 	}
